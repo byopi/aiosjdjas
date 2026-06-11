@@ -1,0 +1,2 @@
+python-telegram-bot>=20.0,<21.0
+pyfotmob>=0.10.0
