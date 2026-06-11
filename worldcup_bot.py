@@ -7,7 +7,7 @@ Variables de entorno: TELEGRAM_TOKEN, ADMIN_ID
 import asyncio
 import logging
 import os
-import re
+import sys
 from collections import defaultdict
 
 from telegram import Bot, Update
@@ -33,34 +33,22 @@ logger = logging.getLogger("WorldCupBot")
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN
 # ─────────────────────────────────────────────
+if "TELEGRAM_TOKEN" not in os.environ or "ADMIN_ID" not in os.environ:
+    logger.error("❌ Faltan las variables de entorno TELEGRAM_TOKEN o ADMIN_ID.")
+    sys.exit(1)
+
 TELEGRAM_TOKEN: str = os.environ["TELEGRAM_TOKEN"]
 ADMIN_ID: int = int(os.environ["ADMIN_ID"])
 
 POLL_INTERVAL: int = 10  # segundos entre cada consulta a FotMob
 
-# ID de la competición Copa del Mundo en FotMob (puede variar; se filtra también por nombre)
-WORLD_CUP_LEAGUE_IDS = {77, 132}  # 77 = FIFA World Cup histórico, 132 puede ser 2026
+WORLD_CUP_LEAGUE_IDS = {77, 132, 289}  
 WORLD_CUP_KEYWORDS = ["world cup", "mundial", "fifa world cup", "coupe du monde"]
 
 # ─────────────────────────────────────────────
 # ESTADO EN MEMORIA
 # ─────────────────────────────────────────────
-
-# { channel_id (int): { "link": "t.me/username | @username | chat_id_str" } }
 registered_channels: dict[int, dict] = {}
-
-# {
-#   match_id: {
-#     "message_ids": { channel_id: message_id },  ← mensaje principal por canal
-#     "home": str, "away": str,
-#     "home_score": int, "away_score": int,
-#     "status": str,  ← "not_started" | "in_progress" | "half_time" | "second_half" | "finished"
-#     "round": str,
-#     "events": set(),  ← event_ids ya procesados
-#     "scorers": list[dict],  ← lista de eventos gol conocidos
-#     "channel_links": { channel_id: link_str }
-#   }
-# }
 active_matches: dict[str, dict] = {}
 
 # ─────────────────────────────────────────────
@@ -213,7 +201,6 @@ def build_substitution_msg(team: str, ins: list[str], outs: list[str], channel_l
 # ─────────────────────────────────────────────
 
 async def safe_edit(bot: Bot, chat_id: int, message_id: int, text: str) -> None:
-    """Edita un mensaje ignorando errores de 'mensaje no modificado'."""
     try:
         await bot.edit_message_text(
             chat_id=chat_id,
@@ -223,7 +210,7 @@ async def safe_edit(bot: Bot, chat_id: int, message_id: int, text: str) -> None:
         )
     except BadRequest as e:
         if "message is not modified" in str(e).lower():
-            pass  # sin cambios, ignorar
+            pass  
         else:
             logger.warning("BadRequest al editar mensaje %s en %s: %s", message_id, chat_id, e)
     except TelegramError as e:
@@ -231,7 +218,6 @@ async def safe_edit(bot: Bot, chat_id: int, message_id: int, text: str) -> None:
 
 
 async def safe_send(bot: Bot, chat_id: int, text: str) -> int | None:
-    """Envía un mensaje y devuelve el message_id, o None si falla."""
     try:
         msg = await bot.send_message(
             chat_id=chat_id,
@@ -245,13 +231,11 @@ async def safe_send(bot: Bot, chat_id: int, text: str) -> int | None:
 
 
 async def get_channel_link(bot: Bot, channel_id: int) -> str:
-    """Obtiene dinámicamente el enlace público del canal via get_chat()."""
     try:
         chat = await bot.get_chat(channel_id)
         if chat.username:
-            return f"t.me/{chat.username}"
+            return f"@{chat.username}"
         else:
-            # Canal privado: usar el ID como referencia
             return str(channel_id)
     except TelegramError as e:
         logger.warning("No se pudo obtener info del canal %s: %s", channel_id, e)
@@ -263,7 +247,6 @@ async def get_channel_link(bot: Bot, channel_id: int) -> str:
 # ─────────────────────────────────────────────
 
 def is_world_cup_match(match_data: dict) -> bool:
-    """Verifica si un partido pertenece a la Copa del Mundo."""
     league_id = match_data.get("leagueId") or match_data.get("tournament", {}).get("id")
     league_name = (
         match_data.get("leagueName", "")
@@ -280,7 +263,6 @@ def is_world_cup_match(match_data: dict) -> bool:
 
 
 def extract_round_label(match_data: dict) -> str:
-    """Extrae la etiqueta de ronda/grupo del partido."""
     round_info = match_data.get("roundInfo") or {}
     round_name = round_info.get("name") or round_info.get("roundName") or ""
     tournament_round = match_data.get("tournamentRound", {}).get("round") or ""
@@ -293,7 +275,6 @@ def extract_round_label(match_data: dict) -> str:
 
 
 def get_match_status_str(status_code: str | None, status_name: str | None) -> str:
-    """Normaliza el estado del partido a una cadena interna."""
     code = (status_code or "").lower()
     name = (status_name or "").lower()
     combined = code + " " + name
@@ -312,10 +293,6 @@ def get_match_status_str(status_code: str | None, status_name: str | None) -> st
 
 
 async def fetch_world_cup_matches() -> list[dict]:
-    """
-    Consulta FotMob y devuelve la lista de partidos del Mundial.
-    Usa pyfotmob de forma asíncrona (ejecutándolo en un executor para no bloquear).
-    """
     if pyfotmob is None:
         logger.error("pyfotmob no está instalado.")
         return []
@@ -325,16 +302,12 @@ async def fetch_world_cup_matches() -> list[dict]:
     def _sync_fetch():
         try:
             client = pyfotmob.FotMob()
-            # Intentar obtener partidos de hoy
-            matches_today = client.get_matches_by_date()  # fecha actual por defecto
+            matches_today = client.get_matches_by_date()  
             all_matches = []
 
-            # La estructura de pyfotmob puede variar; manejamos las más comunes
             if hasattr(matches_today, "leagues"):
                 for league in matches_today.leagues:
                     for match in (league.matches or []):
-                        match_dict = {}
-                        # Intentamos leer atributos comunes
                         try:
                             match_dict = {
                                 "id": str(match.id),
@@ -354,7 +327,6 @@ async def fetch_world_cup_matches() -> list[dict]:
                         except Exception as ex:
                             logger.debug("Error parseando partido: %s", ex)
             elif isinstance(matches_today, dict):
-                # Formato dict raw
                 for league_data in matches_today.get("leagues", []):
                     for m in league_data.get("matches", []):
                         m["leagueName"] = league_data.get("name", "")
@@ -371,7 +343,6 @@ async def fetch_world_cup_matches() -> list[dict]:
 
 
 def _safe_score(match, side: str) -> int:
-    """Extrae el marcador de forma segura."""
     try:
         obj = getattr(match, side, None)
         if obj is None:
@@ -387,7 +358,6 @@ def _safe_score(match, side: str) -> int:
 
 
 def _safe_status_name(match) -> str:
-    """Extrae el nombre de estado de forma segura."""
     try:
         status = getattr(match, "status", None)
         if status is None:
@@ -400,9 +370,6 @@ def _safe_status_name(match) -> str:
 
 
 async def fetch_match_details(match_id: str) -> dict:
-    """
-    Obtiene detalles (eventos: goles, tarjetas, cambios) de un partido específico.
-    """
     if pyfotmob is None:
         return {}
 
@@ -422,25 +389,20 @@ async def fetch_match_details(match_id: str) -> dict:
             }
 
             if isinstance(details, dict):
-                # Marcador
                 header = details.get("header", {})
                 teams = header.get("teams", [{}])
                 if len(teams) >= 2:
                     result["homeScore"] = int((teams[0].get("score") or 0))
                     result["awayScore"] = int((teams[1].get("score") or 0))
 
-                # Estado
                 general = details.get("general", {})
                 match_info = general.get("matchInfo", {})
                 result["statusName"] = match_info.get("status", {}).get("short", "") or ""
 
-                # Eventos
                 event_data = details.get("content", {}).get("matchFacts", {}).get("events", {})
                 events_list = event_data.get("events", []) if isinstance(event_data, dict) else []
                 result["events"] = events_list
-
             else:
-                # Objeto pyfotmob
                 try:
                     result["homeScore"] = _safe_score(details, "home")
                     result["awayScore"] = _safe_score(details, "away")
@@ -469,10 +431,6 @@ async def fetch_match_details(match_id: str) -> dict:
 
 
 def parse_event(event) -> dict | None:
-    """
-    Parsea un evento (gol, tarjeta, cambio) de FotMob en un dict normalizado.
-    Retorna None si no es un evento relevante.
-    """
     try:
         if isinstance(event, dict):
             etype = (event.get("type", {}).get("id", "") or "").lower()
@@ -503,15 +461,13 @@ def parse_event(event) -> dict | None:
         if "goal" in etype:
             if "var" in subtype or "disallowed" in subtype or "cancelled" in subtype:
                 normalized_type = "var_goal"
-            elif "own" in subtype:
-                normalized_type = "goal"
             else:
                 normalized_type = "goal"
         elif "card" in etype:
             if "red" in subtype or "yellowred" in subtype:
                 normalized_type = "red_card"
             else:
-                return None  # amarillas no se notifican
+                return None  
         elif "substitution" in etype or "sub" in etype:
             normalized_type = "substitution"
         else:
@@ -537,12 +493,7 @@ def parse_event(event) -> dict | None:
 # ─────────────────────────────────────────────
 
 async def monitor_loop(bot: Bot) -> None:
-    """Loop principal que consulta FotMob cada POLL_INTERVAL segundos."""
     logger.info("🟢 Monitor loop iniciado. Intervalo: %ds", POLL_INTERVAL)
-
-    # Buffer de cambios pendientes por partido y equipo
-    # { match_id: { team_id: { "ins": [...], "outs": [...] } } }
-    pending_subs: dict[str, dict] = defaultdict(lambda: defaultdict(lambda: {"ins": [], "outs": []}))
 
     while True:
         try:
@@ -554,34 +505,29 @@ async def monitor_loop(bot: Bot) -> None:
             wc_matches = [m for m in matches if is_world_cup_match(m)]
 
             if not wc_matches:
-                logger.info("Sin partidos del Mundial activos ahora mismo.")
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
-
-            logger.info("Partidos del Mundial encontrados: %d", len(wc_matches))
 
             for match_raw in wc_matches:
                 match_id = str(match_raw.get("id", ""))
                 if not match_id:
                     continue
 
-                home = _esc_name(match_raw.get("home", "?"))
-                away = _esc_name(match_raw.get("away", "?"))
+                # Corrección: cambiar _esc_name por _esc
+                home = _esc(match_raw.get("home", "?"))
+                away = _esc(match_raw.get("away", "?"))
                 round_label = extract_round_label(match_raw)
                 status_str = get_match_status_str(
                     match_raw.get("statusCode"),
                     match_raw.get("statusName"),
                 )
 
-                # Saltar partidos no iniciados aún
                 if status_str == "not_started":
                     continue
 
-                # Si es un partido terminado que ya procesamos, saltar
                 if match_id in active_matches and active_matches[match_id]["status"] == "finished":
                     continue
 
-                # ── OBTENER DETALLES DEL PARTIDO ──
                 details = await fetch_match_details(match_id)
                 home_score = details.get("homeScore", match_raw.get("homeScore", 0))
                 away_score = details.get("awayScore", match_raw.get("awayScore", 0))
@@ -594,7 +540,6 @@ async def monitor_loop(bot: Bot) -> None:
 
                 events_raw = details.get("events", [])
 
-                # ── INICIALIZAR PARTIDO NUEVO ──
                 if match_id not in active_matches:
                     active_matches[match_id] = {
                         "message_ids": {},
@@ -612,10 +557,9 @@ async def monitor_loop(bot: Bot) -> None:
                 state = active_matches[match_id]
                 prev_status = state["status"]
 
-                # ── ENVIAR MENSAJE INICIAL (KICKOFF) ──
                 if prev_status in ("not_started", "unknown") and status_str in ("in_progress", "second_half"):
                     logger.info("🏁 INICIO: %s vs %s", home, away)
-                    for ch_id, ch_info in registered_channels.items():
+                    for ch_id in list(registered_channels.keys()):
                         link = await get_channel_link(bot, ch_id)
                         state["channel_links"][ch_id] = link
                         text = build_kickoff_msg(home, away, round_label, link)
@@ -626,12 +570,10 @@ async def monitor_loop(bot: Bot) -> None:
                     state["home_score"] = home_score
                     state["away_score"] = away_score
 
-                # ── ACTUALIZAR ENLACE CANAL SI HACE FALTA ──
-                for ch_id in registered_channels:
+                for ch_id in list(registered_channels.keys()):
                     if ch_id not in state["channel_links"]:
                         state["channel_links"][ch_id] = await get_channel_link(bot, ch_id)
 
-                # ── CAMBIO DE ESTADO: DESCANSO ──
                 if prev_status == "in_progress" and status_str == "half_time":
                     logger.info("⏸ DESCANSO: %s vs %s (%d-%d)", home, away, home_score, away_score)
                     state["home_score"] = home_score
@@ -642,7 +584,6 @@ async def monitor_loop(bot: Bot) -> None:
                         text = build_halftime_msg(home, away, home_score, away_score, round_label, link)
                         await safe_edit(bot, ch_id, msg_id, text)
 
-                # ── CAMBIO DE ESTADO: SEGUNDO TIEMPO ──
                 elif prev_status == "half_time" and status_str in ("second_half", "in_progress"):
                     logger.info("▶️ SEGUNDO TIEMPO: %s vs %s", home, away)
                     state["status"] = "second_half"
@@ -651,7 +592,6 @@ async def monitor_loop(bot: Bot) -> None:
                         text = build_second_half_msg(home, away, home_score, away_score, round_label, link)
                         await safe_edit(bot, ch_id, msg_id, text)
 
-                # ── CAMBIO DE ESTADO: FIN DEL PARTIDO ──
                 elif status_str == "finished" and prev_status != "finished":
                     logger.info("🏆 FIN: %s vs %s (%d-%d)", home, away, home_score, away_score)
                     state["home_score"] = home_score
@@ -662,9 +602,8 @@ async def monitor_loop(bot: Bot) -> None:
                         text = build_finished_msg(home, away, home_score, away_score, round_label, link)
                         await safe_edit(bot, ch_id, msg_id, text)
 
-                # ── PROCESAR EVENTOS (Goles, Tarjetas, Cambios) ──
-                if state["message_ids"]:  # Solo si ya tenemos mensaje principal
-                    sub_buffer: dict[str, dict] = {}  # team_id → {ins, outs}
+                if state["message_ids"]:  
+                    sub_buffer: dict[str, dict] = {}  
 
                     for event_raw in events_raw:
                         evt = parse_event(event_raw)
@@ -673,11 +612,9 @@ async def monitor_loop(bot: Bot) -> None:
 
                         evt_id = evt["id"]
                         if evt_id in state["events"]:
-                            # Evento ya procesado – pero si es gol con scorer "-", revisar actualización
                             if evt["type"] == "goal":
                                 for i, sc in enumerate(state["scorers"]):
                                     if sc["id"] == evt_id and sc["player"] == "-" and evt["player"] != "-":
-                                        logger.info("✏️ Actualizando nombre de goleador: %s", evt["player"])
                                         state["scorers"][i]["player"] = evt["player"]
                                         hs = state["home_score"]
                                         as_ = state["away_score"]
@@ -687,18 +624,15 @@ async def monitor_loop(bot: Bot) -> None:
                                             await safe_edit(bot, ch_id, msg_id, text)
                             continue
 
-                        # Evento nuevo
                         state["events"].add(evt_id)
 
                         if evt["type"] == "goal":
-                            # Determinar a qué equipo pertenece el gol
                             is_home_goal = evt.get("is_home")
                             if is_home_goal is True:
                                 state["home_score"] += 1
                             elif is_home_goal is False:
                                 state["away_score"] += 1
                             else:
-                                # Fallback: usar marcador de FotMob
                                 state["home_score"] = home_score
                                 state["away_score"] = away_score
 
@@ -713,7 +647,6 @@ async def monitor_loop(bot: Bot) -> None:
                                 await safe_edit(bot, ch_id, msg_id, text)
 
                         elif evt["type"] == "var_goal":
-                            # Gol anulado – restar marcador
                             is_home_goal = evt.get("is_home")
                             if is_home_goal is True and state["home_score"] > 0:
                                 state["home_score"] -= 1
@@ -757,7 +690,6 @@ async def monitor_loop(bot: Bot) -> None:
                             sub_buffer[team_id]["ins"].append(player_in)
                             sub_buffer[team_id]["outs"].append(player_out)
 
-                    # Enviar cambios agrupados por equipo
                     for team_id, subs in sub_buffer.items():
                         ins = subs["ins"]
                         outs = subs["outs"]
@@ -768,151 +700,49 @@ async def monitor_loop(bot: Bot) -> None:
                             text = build_substitution_msg(team_name, ins, outs, link)
                             await safe_send(bot, ch_id, text)
 
-                # Actualizar marcador si el partido está en curso
-                if status_str in ("in_progress", "second_half", "half_time"):
-                    state["home_score"] = home_score
-                    state["away_score"] = away_score
-
         except Exception as e:
-            logger.error("Error inesperado en monitor_loop: %s", e, exc_info=True)
-
+            logger.error("Error crítico en el bucle de monitoreo: %s", e, exc_info=True)
+        
         await asyncio.sleep(POLL_INTERVAL)
 
-
-def _esc_name(name: str) -> str:
-    """Limpia el nombre del equipo para uso en HTML."""
-    return str(name).strip()
-
-
 # ─────────────────────────────────────────────
-# COMANDOS DEL BOT
+# COMANDOS ADMINISTRATIVOS Y ARRANQUE
 # ─────────────────────────────────────────────
 
-def admin_only(func):
-    """Decorador que restringe el comando al ADMIN_ID."""
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        if not user or user.id != ADMIN_ID:
-            await update.message.reply_text("❌ No tienes permiso para usar este comando.")
-            return
-        if update.effective_chat.type != "private":
-            await update.message.reply_text("⚠️ Usa este comando en chat privado.")
-            return
-        return await func(update, context)
-    wrapper.__name__ = func.__name__
-    return wrapper
-
-
-@admin_only
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "🏆 <b>Bot Livescores – Mundial FIFA 2026</b>\n\n"
-        "Comandos disponibles:\n"
-        "• /addchannel <id_o_username> – Vincular canal\n"
-        "• /channels – Ver canales registrados\n"
-        "• /removechannel <id> – Eliminar canal\n\n"
-        "El bot comenzará a transmitir partidos automáticamente en los canales registrados.",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-@admin_only
-async def cmd_addchannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Uso: /addchannel <id_del_canal_o_@username>")
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Registra canales automáticos al enviar /start desde un canal o grupo."""
+    chat = update.effective_chat
+    if chat is None:
         return
+        
+    if update.effective_user and update.effective_user.id != ADMIN_ID:
+        return  # Solo el administrador puede dar de alta canales
 
-    raw = context.args[0].strip()
-
-    # Determinar si es un ID numérico o un username
-    try:
-        channel_id = int(raw)
-    except ValueError:
-        # Puede ser @username o username sin @
-        username = raw if raw.startswith("@") else f"@{raw}"
-        channel_id = username  # type: ignore[assignment]
-
-    try:
-        chat = await context.bot.get_chat(channel_id)
-        real_id = chat.id
-        link = f"t.me/{chat.username}" if chat.username else str(real_id)
-        title = chat.title or str(real_id)
-
-        registered_channels[real_id] = {"link": link, "title": title}
-        logger.info("Canal registrado: %s (%s) → %s", title, real_id, link)
-        await update.message.reply_text(
-            f"✅ Canal vinculado:\n"
-            f"<b>{_esc(title)}</b>\n"
-            f"ID: <code>{real_id}</code>\n"
-            f"Enlace: {_esc(link)}",
-            parse_mode=ParseMode.HTML,
-        )
-    except TelegramError as e:
-        await update.message.reply_text(f"❌ No se pudo obtener info del canal: {e}\n\n"
-                                        "Asegúrate de que el bot es administrador del canal.")
-
-
-@admin_only
-async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not registered_channels:
-        await update.message.reply_text("No hay canales registrados aún.")
-        return
-
-    lines = ["<b>Canales registrados:</b>\n"]
-    for ch_id, info in registered_channels.items():
-        lines.append(f"• {_esc(info.get('title', '?'))} — <code>{ch_id}</code> — {_esc(info.get('link', ''))}")
-
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-@admin_only
-async def cmd_removechannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Uso: /removechannel <id_del_canal>")
-        return
-    try:
-        ch_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("El ID del canal debe ser numérico.")
-        return
-
-    if ch_id in registered_channels:
-        info = registered_channels.pop(ch_id)
-        await update.message.reply_text(f"✅ Canal <b>{_esc(info.get('title', str(ch_id)))}</b> eliminado.", parse_mode=ParseMode.HTML)
+    if chat.id not in registered_channels:
+        registered_channels[chat.id] = {"link": f"@{chat.username}" if chat.username else str(chat.id)}
+        await update.message.reply_text(f"✅ Canal registrado con éxito para Livescores ({chat.id}).")
     else:
-        await update.message.reply_text("❌ Ese canal no está registrado.")
-
-
-# ─────────────────────────────────────────────
-# PUNTO DE ENTRADA
-# ─────────────────────────────────────────────
-
-async def post_init(application: Application) -> None:
-    """Se ejecuta después de que la aplicación está lista; arranca el monitor loop."""
-    logger.info("Bot iniciado. Arrancando monitor loop...")
-    asyncio.create_task(monitor_loop(application.bot))
+        await update.message.reply_text("ℹ️ Este canal ya se encuentra en la lista de monitoreo.")
 
 
 def main() -> None:
+    """Configuración e inicio del Bot usando python-telegram-bot v20+."""
     if pyfotmob is None:
-        logger.error("❌ pyfotmob no está instalado. Instálalo con: pip install pyfotmob")
+        logger.error("❌ El módulo 'pyfotmob' no se pudo importar correctamente.")
         return
 
-    logger.info("Iniciando Bot Mundial FIFA 2026...")
-    app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+    # Crear la aplicación del bot de Telegram
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("addchannel", cmd_addchannel))
-    app.add_handler(CommandHandler("channels", cmd_channels))
-    app.add_handler(CommandHandler("removechannel", cmd_removechannel))
+    # Handlers
+    application.add_handler(CommandHandler("start", start_cmd))
 
-    logger.info("Bot en ejecución. Esperando partidos...")
-    app.run_polling(allowed_updates=["message"])
+    # Obtener el loop asíncrono para inyectar nuestra tarea de fondo (FotMob Monitoring)
+    loop = asyncio.get_event_loop()
+    loop.create_task(monitor_loop(application.bot))
+
+    logger.info("🚀 Servidor listo. Arrancando Bot de Telegram de forma continua...")
+    application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
